@@ -3,9 +3,6 @@
  *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
  *--------------------------------------------------------------------------------------------*/
 
-// CSS.
-import './consoleInstanceState.css';
-
 // React.
 import { useEffect, useState } from 'react';
 
@@ -16,11 +13,11 @@ import { DisposableStore } from '../../../../../base/common/lifecycle.js';
 import { RuntimeStatusIcon } from './runtimeStatus.js';
 import { runtimeStateToRuntimeStatus } from '../../common/sessionDisplayUtils.js';
 
-interface ConsoleInstanceStateProps {
+interface ConsoleSessionStatusIconProps {
 	readonly positronConsoleInstance: IPositronConsoleInstance;
 }
 
-export const ConsoleInstanceState = ({ positronConsoleInstance }: ConsoleInstanceStateProps) => {
+export const ConsoleSessionStatusIcon = ({ positronConsoleInstance }: ConsoleSessionStatusIconProps) => {
 	// Get the initial runtime state from the attached session, or default to
 	// Uninitialized if no session is attached.
 	const getInitialRuntimeState = () =>
