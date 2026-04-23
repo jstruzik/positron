@@ -158,10 +158,20 @@ suite('Interpreter Path Service', async () => {
 
         const _didChangeInterpreterEmitter = TypeMoq.Mock.ofType<EventEmitter<InterpreterConfigurationScope>>();
         interpreterPathService._didChangeInterpreterEmitter = _didChangeInterpreterEmitter.object;
+        // --- Start Positron ---
+        // Payload now carries startSession/source; default for .update() is true/'unspecified'.
         _didChangeInterpreterEmitter
-            .setup((emitter) => emitter.fire({ uri: resource, configTarget: ConfigurationTarget.Workspace }))
+            .setup((emitter) =>
+                emitter.fire({
+                    uri: resource,
+                    configTarget: ConfigurationTarget.Workspace,
+                    startSession: true,
+                    source: 'unspecified',
+                }),
+            )
             .returns(() => undefined)
             .verifiable(TypeMoq.Times.once());
+        // --- End Positron ---
 
         await interpreterPathService.update(resource, ConfigurationTarget.Workspace, interpreterPath);
 
@@ -223,10 +233,19 @@ suite('Interpreter Path Service', async () => {
 
         const _didChangeInterpreterEmitter = TypeMoq.Mock.ofType<EventEmitter<InterpreterConfigurationScope>>();
         interpreterPathService._didChangeInterpreterEmitter = _didChangeInterpreterEmitter.object;
+        // --- Start Positron ---
         _didChangeInterpreterEmitter
-            .setup((emitter) => emitter.fire({ uri: resource, configTarget: ConfigurationTarget.WorkspaceFolder }))
+            .setup((emitter) =>
+                emitter.fire({
+                    uri: resource,
+                    configTarget: ConfigurationTarget.WorkspaceFolder,
+                    startSession: true,
+                    source: 'unspecified',
+                }),
+            )
             .returns(() => undefined)
             .verifiable(TypeMoq.Times.once());
+        // --- End Positron ---
 
         await interpreterPathService.update(resource, ConfigurationTarget.WorkspaceFolder, interpreterPath);
 
@@ -466,14 +485,54 @@ suite('Interpreter Path Service', async () => {
             .returns(() => true)
             .verifiable(TypeMoq.Times.once());
         interpreterPathService._didChangeInterpreterEmitter = _didChangeInterpreterEmitter.object;
+        // --- Start Positron ---
+        // First fire per activation is classified as storage-only / 'config-initial'.
         _didChangeInterpreterEmitter
-            .setup((emitter) => emitter.fire({ uri: undefined, configTarget: ConfigurationTarget.Global }))
+            .setup((emitter) =>
+                emitter.fire({
+                    uri: undefined,
+                    configTarget: ConfigurationTarget.Global,
+                    startSession: false,
+                    source: 'config-initial',
+                }),
+            )
             .returns(() => undefined)
             .verifiable(TypeMoq.Times.once());
+        // --- End Positron ---
         await interpreterPathService.onDidChangeConfiguration(event.object);
         _didChangeInterpreterEmitter.verifyAll();
         event.verifyAll();
     });
+
+    // --- Start Positron ---
+    test('Subsequent defaultInterpreterPathSetting change fires as user-edit (startSession: true)', async () => {
+        const _didChangeInterpreterEmitter = TypeMoq.Mock.ofType<EventEmitter<InterpreterConfigurationScope>>();
+        const event = TypeMoq.Mock.ofType<ConfigurationChangeEvent>();
+        event
+            .setup((e) => e.affectsConfiguration(`python.${defaultInterpreterPathSetting}`))
+            .returns(() => true);
+        interpreterPathService._didChangeInterpreterEmitter = _didChangeInterpreterEmitter.object;
+
+        // First call — classified as 'config-initial'.
+        await interpreterPathService.onDidChangeConfiguration(event.object);
+
+        _didChangeInterpreterEmitter
+            .setup((emitter) =>
+                emitter.fire({
+                    uri: undefined,
+                    configTarget: ConfigurationTarget.Global,
+                    startSession: true,
+                    source: 'config-user-edit',
+                }),
+            )
+            .returns(() => undefined)
+            .verifiable(TypeMoq.Times.once());
+
+        // Second call — classified as 'config-user-edit'.
+        await interpreterPathService.onDidChangeConfiguration(event.object);
+        _didChangeInterpreterEmitter.verifyAll();
+    });
+    // --- End Positron ---
 
     test('If some other setting changed, no event is fired', async () => {
         const _didChangeInterpreterEmitter = TypeMoq.Mock.ofType<EventEmitter<InterpreterConfigurationScope>>();

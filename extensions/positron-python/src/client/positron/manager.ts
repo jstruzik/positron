@@ -93,21 +93,58 @@ export class PythonRuntimeManager implements IPythonRuntimeManager, Disposable {
 
         this.disposables.push(
             positron.runtime.registerLanguageRuntimeManager('python', this),
-            // When an interpreter is added, register a corresponding language runtime.
+            // When an interpreter is added or removed, update our registry and (on removal)
+            // shut down any sessions still backed by the deleted environment.
             interpreterService.onDidChangeInterpreters(async (event) => {
                 if (!event.old && event.new) {
                     // An interpreter was added.
                     const interpreterPath = event.new.path;
                     await checkAndInstallPython(interpreterPath, serviceContainer);
                     await this.registerLanguageRuntimeFromPath(interpreterPath);
+                } else if (event.old && !event.new) {
+                    // An interpreter was removed externally (e.g. `.venv` directory deleted). Clear
+                    // stored metadata so we don't hand out stale runtimes, and shut down any live
+                    // sessions using the deleted path. See pet-bump-2b-event-split plan, D1.
+                    const deletedPath = event.old.path;
+                    this.registeredPythonRuntimes.delete(deletedPath);
+                    try {
+                        const sessions = await positron.runtime.getActiveSessions();
+                        const toShutdown = sessions.filter(
+                            (s) =>
+                                (s.runtimeMetadata.extraRuntimeData as PythonRuntimeExtraData).pythonPath ===
+                                deletedPath,
+                        );
+                        if (toShutdown.length > 0) {
+                            traceInfo(
+                                `Shutting down ${toShutdown.length} session(s) for deleted interpreter ${deletedPath}`,
+                            );
+                            await Promise.all(
+                                toShutdown.map((s) => s.shutdown(positron.RuntimeExitReason.Shutdown)),
+                            );
+                        }
+                    } catch (error) {
+                        traceError(`Failed to clean up sessions for deleted interpreter ${deletedPath}: ${error}`);
+                    }
                 }
             }),
 
-            interpreterService.onDidChangeInterpreter(async (workspaceUri) => {
-                const interpreter = await interpreterService.getActiveInterpreter(workspaceUri);
+            interpreterService.onDidChangeInterpreter(async (event) => {
+                // Split event: only session-intent fires should start a session. Storage-only fires
+                // (autoselect, migration, install-complete, active-env-deleted, config-initial)
+                // must not spawn a console here — that would reintroduce the #12116 regression.
+                if (!event.startSession) {
+                    traceInfo(
+                        `Skipping session start for onDidChangeInterpreter fire (source=${event.source}, resource=${event.resource?.fsPath ?? 'undefined'})`,
+                    );
+                    return;
+                }
+                traceInfo(
+                    `Handling onDidChangeInterpreter fire (source=${event.source}, resource=${event.resource?.fsPath ?? 'undefined'})`,
+                );
+                const interpreter = await interpreterService.getActiveInterpreter(event.resource);
                 if (!interpreter) {
                     traceError(
-                        `Interpreter not found; could not select language runtime. Workspace: ${workspaceUri?.fsPath}`,
+                        `Interpreter not found; could not select language runtime. Workspace: ${event.resource?.fsPath}`,
                     );
                     return;
                 }

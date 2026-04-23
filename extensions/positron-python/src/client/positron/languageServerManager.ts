@@ -105,7 +105,11 @@ class LanguageServerManager implements vscode.Disposable {
             configTarget = vscode.ConfigurationTarget.WorkspaceFolder;
         }
 
-        await this._pythonPathUpdaterService.updatePythonPath(pythonPath, configTarget, 'ui', folderUri);
+        // Storage-only: Pyright needs the path written but the session is already running.
+        await this._pythonPathUpdaterService.updatePythonPath(pythonPath, configTarget, 'ui', folderUri, {
+            startSession: false,
+            source: 'positron-ls-manager',
+        });
     }
 
     /**

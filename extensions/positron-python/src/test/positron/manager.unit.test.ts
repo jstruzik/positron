@@ -579,3 +579,114 @@ suite('Python runtime manager - recommendedWorkspaceRuntime', () => {
         assert.strictEqual(result?.extraRuntimeData?.pythonPath, venvPythonPath);
     });
 });
+
+// --- Start Positron ---
+suite('Python runtime manager - onDidChangeInterpreter filter', () => {
+    // Covers pet-bump-2b-event-split: storage-only fires must not spawn a console; user-intent
+    // fires must. See `.plans/pet-bump-2b-event-split.md`.
+
+    let serviceContainer: TypeMoq.IMock<IServiceContainer>;
+    let interpreterService: TypeMoq.IMock<IInterpreterService>;
+    let disposableRegistry: TypeMoq.IMock<IDisposableRegistry>;
+    let onDidChangeInterpreterEmitter: vscode.EventEmitter<
+        import('../../client/interpreter/contracts').InterpreterChangeEvent
+    >;
+    let onDidChangeInterpretersEmitter: vscode.EventEmitter<
+        import('../../client/interpreter/contracts').PythonEnvironmentsChangedEvent
+    >;
+    let pythonRuntimeManager: PythonRuntimeManager;
+    let selectSpy: sinon.SinonStub;
+    let getActiveSessionsImpl: () => Promise<positron.LanguageRuntimeSession[]>;
+
+    setup(() => {
+        serviceContainer = createTypeMoq<IServiceContainer>();
+        interpreterService = createTypeMoq<IInterpreterService>();
+        disposableRegistry = createTypeMoq<IDisposableRegistry>();
+
+        const registryArray: IDisposable[] = [];
+        disposableRegistry
+            .setup((d) => d.push(TypeMoq.It.isAny()))
+            .callback((item: IDisposable) => registryArray.push(item));
+        serviceContainer.setup((s) => s.get(IDisposableRegistry)).returns(() => registryArray);
+
+        onDidChangeInterpreterEmitter = new vscode.EventEmitter();
+        onDidChangeInterpretersEmitter = new vscode.EventEmitter();
+        interpreterService.setup((i) => i.onDidChangeInterpreter).returns(() => onDidChangeInterpreterEmitter.event);
+        interpreterService.setup((i) => i.onDidChangeInterpreters).returns(() => onDidChangeInterpretersEmitter.event);
+
+        // positron.runtime may have getActiveSessions replaced by Object.assign in a prior test
+        // (e.g. languageServerManager). Assign directly so we read from our fixture regardless of
+        // that prior state. Each test overrides getActiveSessionsImpl.
+        getActiveSessionsImpl = async () => [];
+        Object.assign(positron.runtime, {
+            getActiveSessions: () => getActiveSessionsImpl(),
+        });
+
+        pythonRuntimeManager = new PythonRuntimeManager(serviceContainer.object, interpreterService.object);
+        selectSpy = sinon.stub(pythonRuntimeManager, 'selectLanguageRuntimeFromPath').resolves('runtime-id');
+    });
+
+    teardown(() => {
+        sinon.restore();
+        onDidChangeInterpreterEmitter.dispose();
+        onDidChangeInterpretersEmitter.dispose();
+    });
+
+    test('storage-only fire (startSession: false) does not call selectLanguageRuntimeFromPath', async () => {
+        onDidChangeInterpreterEmitter.fire({
+            resource: undefined,
+            startSession: false,
+            source: 'install-complete',
+        });
+        // Give the async listener a tick to run.
+        await new Promise((r) => setTimeout(r, 0));
+        sinon.assert.notCalled(selectSpy);
+    });
+
+    test('session-intent fire (startSession: true) calls selectLanguageRuntimeFromPath', async () => {
+        const interpreter = { path: '/path/to/python' } as PythonEnvironment;
+        interpreterService.setup((i) => i.getActiveInterpreter(TypeMoq.It.isAny())).returns(() => Promise.resolve(interpreter));
+
+        onDidChangeInterpreterEmitter.fire({
+            resource: undefined,
+            startSession: true,
+            source: 'quickpick',
+        });
+        await new Promise((r) => setTimeout(r, 0));
+        sinon.assert.calledOnceWithExactly(selectSpy, '/path/to/python');
+    });
+
+    test('interpreter deletion: clears registry entry and shuts down matching sessions', async () => {
+        const deletedPath = '/path/to/deleted/python';
+        pythonRuntimeManager.registeredPythonRuntimes.set(deletedPath, {
+            runtimeId: 'r',
+            extraRuntimeData: { pythonPath: deletedPath },
+        } as any);
+
+        // Wait until matching session's shutdown is called (or time out).
+        let shutdownResolver: () => void = () => undefined;
+        const shutdownDone = new Promise<void>((resolve) => {
+            shutdownResolver = resolve;
+        });
+        const matchingSession = {
+            runtimeMetadata: { extraRuntimeData: { pythonPath: deletedPath } },
+            shutdown: sinon.stub().callsFake(async () => {
+                shutdownResolver();
+            }),
+        };
+        const otherSession = {
+            runtimeMetadata: { extraRuntimeData: { pythonPath: '/other/python' } },
+            shutdown: sinon.stub().resolves(),
+        };
+        getActiveSessionsImpl = async () => [matchingSession as any, otherSession as any];
+
+        onDidChangeInterpretersEmitter.fire({ old: { path: deletedPath } as any, new: undefined });
+        await Promise.race([shutdownDone, new Promise((r) => setTimeout(r, 500))]);
+
+        assert.strictEqual(pythonRuntimeManager.registeredPythonRuntimes.has(deletedPath), false);
+        sinon.assert.calledOnce(matchingSession.shutdown);
+        sinon.assert.notCalled(otherSession.shutdown);
+        sinon.assert.notCalled(selectSpy);
+    });
+});
+// --- End Positron ---
