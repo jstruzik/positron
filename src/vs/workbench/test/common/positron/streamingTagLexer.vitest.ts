@@ -541,4 +541,140 @@ describe('StreamingTagLexer', () => {
 			`);
 		});
 	});
+
+	describe('no-match reset (false-match regression)', () => {
+		it('emits a tail-aligned mismatch as a single text chunk, not a fabricated tag', async () => {
+			const { chunks, contentHandler } = createCollector();
+			const lexer = new StreamingTagLexer({
+				tagNames: ['code'],
+				contentHandler,
+			});
+
+			// '<xode>' shares the tail of 'code' but mismatches the first
+			// char. It must be emitted as literal text, not a fabricated tag.
+			await lexer.process('<xode>');
+			await lexer.flush();
+
+			expect(chunks).toMatchInlineSnapshot(`
+				[
+				  {
+				    "text": "<xode>",
+				    "type": "text",
+				  },
+				]
+			`);
+		});
+
+		it('still recognizes the real tag (control)', async () => {
+			const { chunks, contentHandler } = createCollector();
+			const lexer = new StreamingTagLexer({
+				tagNames: ['code'],
+				contentHandler,
+			});
+
+			await lexer.process('<code>');
+			await lexer.flush();
+
+			expect(chunks).toMatchInlineSnapshot(`
+				[
+				  {
+				    "attributes": {},
+				    "kind": "open",
+				    "name": "code",
+				    "originalText": "<code>",
+				    "type": "tag",
+				  },
+				]
+			`);
+		});
+
+		it('passes a fully unmatched token as text (control)', async () => {
+			const { chunks, contentHandler } = createCollector();
+			const lexer = new StreamingTagLexer({
+				tagNames: ['code'],
+				contentHandler,
+			});
+
+			await lexer.process('<zzzz>');
+			await lexer.flush();
+
+			expect(chunks).toMatchInlineSnapshot(`
+				[
+				  {
+				    "text": "<zzzz>",
+				    "type": "text",
+				  },
+				]
+			`);
+		});
+
+		it('does not let a mid-name mismatch poison the next valid tag', async () => {
+			const { chunks, contentHandler } = createCollector();
+			const lexer = new StreamingTagLexer({
+				tagNames: ['code'],
+				contentHandler,
+			});
+
+			// '<cxde>' matches 'c' then mismatches at 'x'. The reset must not
+			// leave a stale tag-name index that corrupts the following '<code>'.
+			await lexer.process('<cxde><code>ok</code>');
+			await lexer.flush();
+
+			expect(chunks).toMatchInlineSnapshot(`
+				[
+				  {
+				    "text": "<cxde>",
+				    "type": "text",
+				  },
+				  {
+				    "attributes": {},
+				    "kind": "open",
+				    "name": "code",
+				    "originalText": "<code>",
+				    "type": "tag",
+				  },
+				  {
+				    "text": "ok",
+				    "type": "text",
+				  },
+				  {
+				    "attributes": {},
+				    "kind": "close",
+				    "name": "code",
+				    "originalText": "</code>",
+				    "type": "tag",
+				  },
+				]
+			`);
+		});
+
+		it('does not let a mid-name mismatch poison the next valid close tag', async () => {
+			const { chunks, contentHandler } = createCollector();
+			const lexer = new StreamingTagLexer({
+				tagNames: ['code'],
+				contentHandler,
+			});
+
+			// Close-tag equivalent: '</cxde>' is text, then '</code>' is a
+			// real close tag.
+			await lexer.process('</cxde></code>');
+			await lexer.flush();
+
+			expect(chunks).toMatchInlineSnapshot(`
+				[
+				  {
+				    "text": "</cxde>",
+				    "type": "text",
+				  },
+				  {
+				    "attributes": {},
+				    "kind": "close",
+				    "name": "code",
+				    "originalText": "</code>",
+				    "type": "tag",
+				  },
+				]
+			`);
+		});
+	});
 });

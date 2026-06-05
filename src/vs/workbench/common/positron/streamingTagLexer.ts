@@ -141,12 +141,12 @@ export class StreamingTagLexer<TagNameT extends string> {
 						// Didn't match any tag names, as in '<Z'
 						this.resetPotentialTagStateVars();
 						this.state = 'TEXT';
+					} else {
+						this.state = 'TAG_NAME';
+						this.tagNamePartial = char;
+						this.kind = 'open';
+						this.tagNamePartialIdx++;
 					}
-
-					this.state = 'TAG_NAME';
-					this.tagNamePartial = char;
-					this.kind = 'open';
-					this.tagNamePartialIdx++;
 				} else {
 					// Not a valid tag name starting character
 					this.resetPotentialTagStateVars();
@@ -166,12 +166,12 @@ export class StreamingTagLexer<TagNameT extends string> {
 						// Didn't match any tag names, as in '</Z'
 						this.resetPotentialTagStateVars();
 						this.state = 'TEXT';
+					} else {
+						this.state = 'TAG_NAME';
+						this.tagNamePartial = char;
+						this.kind = 'close';
+						this.tagNamePartialIdx++;
 					}
-
-					this.state = 'TAG_NAME';
-					this.tagNamePartial = char;
-					this.kind = 'close';
-					this.tagNamePartialIdx++;
 				} else {
 					// Not a valid tag name starting character
 					this.resetPotentialTagStateVars();
@@ -224,10 +224,10 @@ export class StreamingTagLexer<TagNameT extends string> {
 						// Didn't match any tag names, as in '<SHINYX'
 						this.resetPotentialTagStateVars();
 						this.state = 'TEXT';
+					} else {
+						this.tagNamePartial += char;
+						this.tagNamePartialIdx++;
 					}
-
-					this.tagNamePartial += char;
-					this.tagNamePartialIdx++;
 				} else {
 					// Not a valid tag name character, as in '<SHIN!'
 					this.resetPotentialTagStateVars();
