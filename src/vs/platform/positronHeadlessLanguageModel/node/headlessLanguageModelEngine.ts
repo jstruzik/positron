@@ -14,12 +14,22 @@ import { ICredentials, IEngineChatRequest, IHeadlessLanguageModelEngine, IModelD
  * Auth-provider ids whose user-facing config namespace differs from the id.
  * Mirrors the provider bridge's CONFIG_KEY_OVERRIDES so the facade reads the
  * same `authentication.<configKey>.*` settings the assistant extension does.
+ *
+ * SYNC POINTER: this mirrors the bridge's module-private copy at
+ * `ai-provider-bridge/src/positron/auth.ts:16-20`. The bridge does not export
+ * it, so this copy must be kept in sync by hand whenever that one changes.
  */
 const CONFIG_KEY_OVERRIDES: Record<string, string> = {
 	'anthropic-api': 'anthropic',
 	'ms-foundry': 'foundry',
 	'snowflake-cortex': 'snowflake',
 };
+
+/** Compile-time assertion that VS Code's CancellationToken satisfies the bridge's. */
+function toBridgeToken(token: CancellationToken): BridgeCancellationToken { return token; }
+
+/** Compile-time assertion that our ICredentials satisfies the bridge's ProviderCredentials. */
+function toBridgeCredentials(credentials: ICredentials): ProviderCredentials { return credentials; }
 
 /**
  * The Node-side egress engine: the one place that touches the provider bridge
@@ -68,14 +78,14 @@ export class HeadlessLanguageModelEngine implements IHeadlessLanguageModelEngine
 
 	async listModels(providerId: string, credentials: ICredentials): Promise<IModelDescriptor[]> {
 		const registry = await this.registry();
-		const models = await registry.getModelsForProvider(providerId, credentials as ProviderCredentials);
+		const models = await registry.getModelsForProvider(providerId, toBridgeCredentials(credentials));
 		return models.map((model: ModelInfo) => ({ id: model.id, name: model.name, vendor: model.vendor, providerId }));
 	}
 
 	streamChat(request: IEngineChatRequest, token: CancellationToken): AsyncIterable<string> {
 		return new AsyncIterableObject<string>(async (emitter) => {
 			const registry = await this.registry();
-			const client = registry.getClientForProvider(request.providerId, request.credentials as ProviderCredentials);
+			const client = registry.getClientForProvider(request.providerId, toBridgeCredentials(request.credentials));
 			if (!client) {
 				throw new Error(`No client for provider ${request.providerId}`);
 			}
@@ -90,8 +100,7 @@ export class HeadlessLanguageModelEngine implements IHeadlessLanguageModelEngine
 				messages,
 				systemPrompt: request.systemPrompt,
 				maxOutputTokens: request.maxOutputTokens,
-				// A VS Code CancellationToken is structurally a bridge token.
-				cancellationToken: token as unknown as BridgeCancellationToken,
+				cancellationToken: toBridgeToken(token),
 			});
 
 			for await (const part of stream) {
