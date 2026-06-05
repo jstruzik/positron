@@ -1688,7 +1688,14 @@ export default tseslint.config(
 						'@xterm/xterm',
 						'yauzl',
 						'yazl',
-						'zlib'
+						'zlib',
+						// --- Start Positron ---
+						// Headless language model engine (Node egress): the provider
+						// bridge and the AI SDK it streams through.
+						'ai',
+						'ai-provider-bridge',
+						'ai-provider-bridge/providers',
+						// --- End Positron ---
 					]
 				},
 				{
