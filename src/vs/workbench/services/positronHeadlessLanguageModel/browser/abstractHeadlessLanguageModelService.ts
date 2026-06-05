@@ -7,7 +7,7 @@ import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { hasKey } from '../../../../base/common/types.js';
-import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
+import { IConfigurationChangeEvent, IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { AuthenticationSession, IAuthenticationService } from '../../authentication/common/authentication.js';
 import {
@@ -52,6 +52,8 @@ export abstract class AbstractHeadlessLanguageModelService extends Disposable im
 	private _engineCreated = false;
 	/** Provider -> auth mappings, fetched once from the engine (the bridge owns them). */
 	private _mappings: Promise<readonly IProviderMapping[]> | undefined;
+	/** Synchronous snapshot of the loaded mappings, for config-key derivation in event handlers; set once mappings load. */
+	private _loadedMappings: readonly IProviderMapping[] | undefined;
 	/** Auth provider ids we care about, for filtering session-change events; set once mappings load. */
 	private _mappedAuthProviderIds: ReadonlySet<string> | undefined;
 	/** Cached model listing; invalidated on auth change. Credentials are never cached. */
@@ -70,10 +72,62 @@ export abstract class AbstractHeadlessLanguageModelService extends Disposable im
 		// safely ignored by the filter.
 		this._register(this._authService.onDidChangeSessions(e => {
 			if (this._mappedAuthProviderIds?.has(e.providerId)) {
-				this._state = undefined;
-				this._onDidChangeAvailableModels.fire();
+				this._invalidate();
 			}
 		}));
+
+		// Availability also depends on per-provider config the credential shaping
+		// reads (base URLs, custom headers, AWS region, Snowflake host/account).
+		// A change to any of those keys can flip a provider's availability or the
+		// listed models, so the cached state must be dropped. Same guard as
+		// above: if mappings have not loaded there is no state to invalidate.
+		this._register(this._configService.onDidChangeConfiguration(e => {
+			if (this.affectsCredentialConfig(e)) {
+				this._invalidate();
+			}
+		}));
+
+		// A mapped auth provider registering (e.g. the user signs into a provider
+		// whose backend was not registered at the first lookup) or unregistering
+		// changes which providers the sweep queries. Drop the cached state so the
+		// next listing reflects the new provider set.
+		this._register(this._authService.onDidRegisterAuthenticationProvider(provider => {
+			if (this._mappedAuthProviderIds?.has(provider.id)) {
+				this._invalidate();
+			}
+		}));
+		this._register(this._authService.onDidUnregisterAuthenticationProvider(provider => {
+			if (this._mappedAuthProviderIds?.has(provider.id)) {
+				this._invalidate();
+			}
+		}));
+	}
+
+	/** Drop the cached model listing and notify pickers (R8). */
+	private _invalidate(): void {
+		this._state = undefined;
+		this._onDidChangeAvailableModels.fire();
+	}
+
+	/**
+	 * Whether a config change touches any key the credential shaping reads for a
+	 * loaded mapping: each apikey mapping's `authentication.<configKey>.baseUrl` /
+	 * `.customHeaders`, plus the fixed `authentication.aws.credentials` and
+	 * `authentication.snowflake.credentials` namespaces. Returns false until
+	 * mappings load (nothing cached to invalidate yet).
+	 */
+	private affectsCredentialConfig(e: IConfigurationChangeEvent): boolean {
+		const mappings = this._loadedMappings;
+		if (!mappings) {
+			return false;
+		}
+		if (e.affectsConfiguration('authentication.aws.credentials')
+			|| e.affectsConfiguration('authentication.snowflake.credentials')) {
+			return true;
+		}
+		return mappings.some(mapping =>
+			e.affectsConfiguration(`authentication.${mapping.configKey}.baseUrl`)
+			|| e.affectsConfiguration(`authentication.${mapping.configKey}.customHeaders`));
 	}
 
 	/** Create the engine for this environment, or `undefined` if none is reachable. */
@@ -93,20 +147,34 @@ export abstract class AbstractHeadlessLanguageModelService extends Disposable im
 			return { available: false, reason: 'no-providers-configured' };
 		}
 
-		const state = await this.resolveState();
-		if (!state.anyCredential) {
-			return { available: false, reason: 'sign-in-required' };
+		// The availability pre-check (listing state + fresh credential resolution)
+		// can fail transiently (IPC/bridge startup). Surface that as a distinct,
+		// retryable reason rather than throwing -- the service's contract is that
+		// only the returned `text` iterable throws mid-stream. The streamChat call
+		// below returns its iterable synchronously, so it stays outside this guard
+		// and its mid-flight failures still surface through `text`.
+		let chosen: IModelDescriptor | undefined;
+		let credentials: ICredentials | undefined;
+		try {
+			const state = await this.resolveState();
+			if (!state.anyCredential) {
+				return { available: false, reason: 'sign-in-required' };
+			}
+
+			const selection = params.model ?? FastCheap;
+			chosen = selectModel(state.models, selection, this.tierPatterns(selection));
+			if (!chosen) {
+				return { available: false, reason: 'no-model-matched' };
+			}
+
+			// Resolve credentials freshly for the chosen provider so short-lived
+			// tokens stay valid (R10). The token may have lapsed since listing.
+			credentials = await this.resolveCredentialFor(chosen.providerId);
+		} catch (error) {
+			this._logService.warn(`[headless-lm] Availability check failed: ${error}`);
+			return { available: false, reason: 'temporarily-unavailable' };
 		}
 
-		const selection = params.model ?? FastCheap;
-		const chosen = selectModel(state.models, selection, this.tierPatterns(selection));
-		if (!chosen) {
-			return { available: false, reason: 'no-model-matched' };
-		}
-
-		// Resolve credentials freshly for the chosen provider so short-lived
-		// tokens stay valid (R10). The token may have lapsed since listing.
-		const credentials = await this.resolveCredentialFor(chosen.providerId);
 		if (!credentials) {
 			return { available: false, reason: 'sign-in-required' };
 		}
@@ -124,13 +192,26 @@ export abstract class AbstractHeadlessLanguageModelService extends Disposable im
 	}
 
 	async getAvailableModels(): Promise<readonly IAvailableModel[]> {
-		const state = await this.resolveState();
+		// A transient failure yields an empty list (the list API has no reason
+		// slot); resolveState() self-heals so the next call can recover.
+		let state: IResolvedState;
+		try {
+			state = await this.resolveState();
+		} catch (error) {
+			this._logService.warn(`[headless-lm] Listing available models failed: ${error}`);
+			return [];
+		}
 		return state.models.map(model => ({ id: model.id, name: model.name, vendor: model.vendor }));
 	}
 
 	private resolveState(): Promise<IResolvedState> {
 		if (!this._state) {
-			this._state = this.computeState();
+			// Self-heal: a rejected computeState() must not be cached, or a
+			// transient failure would break the service until window reload.
+			this._state = this.computeState().catch(error => {
+				this._state = undefined;
+				throw error;
+			});
 		}
 		return this._state;
 	}
@@ -192,8 +273,17 @@ export abstract class AbstractHeadlessLanguageModelService extends Disposable im
 			const engine = this.getEngine();
 			this._mappings = (engine ? engine.getProviderMappings() : Promise.resolve([]))
 				.then(mappings => {
+					this._loadedMappings = mappings;
 					this._mappedAuthProviderIds = new Set(mappings.map(mapping => mapping.authProviderId));
 					return mappings;
+				})
+				// Self-heal: a rejected fetch must not be memoized forever, or a
+				// transient IPC/bridge-startup failure would break the service
+				// until window reload. Clear the field so the next call refetches.
+				.catch(error => {
+					this._mappings = undefined;
+					this._loadedMappings = undefined;
+					throw error;
 				});
 		}
 		return this._mappings;
@@ -249,7 +339,19 @@ export abstract class AbstractHeadlessLanguageModelService extends Disposable im
 		}
 	}
 
-	/** Shape a session token into provider credentials, mirroring the bridge. */
+	/**
+	 * Shape a session token into provider credentials, mirroring the bridge.
+	 *
+	 * SYNC POINTER: this is a near-line-by-line mirror of the bridge's
+	 * `getMappedCredentials` (`ai-provider-bridge/src/positron/auth.ts:66-201`)
+	 * and must be kept in sync with it. The bridge's own resolver is
+	 * `vscode.authentication`-bound and cannot load in the renderer/shared
+	 * process, so this copy reads from `IAuthenticationService` instead. The
+	 * fixed config namespaces below (`authentication.aws.credentials`,
+	 * `authentication.snowflake.credentials`) are intentional: they match where
+	 * the assistant already stores those credentials, so they are not derived
+	 * from `mapping.configKey`.
+	 */
 	private toCredentials(mapping: IProviderMapping, accessToken: string): ICredentials | undefined {
 		switch (mapping.credentialType) {
 			case 'oauth':

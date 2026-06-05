@@ -107,11 +107,14 @@ export type StreamTextResult =
  * - `sign-in-required`: a provider could work, but no session exists. The
  *   actionable hint case (R7) -- the consumer can surface "sign in to enable ...".
  * - `no-model-matched`: signed in, but the requested intent matched no available model.
+ * - `temporarily-unavailable`: a transient backend failure -- the request could
+ *   not be set up but may succeed on retry. Internal/logged, not user-facing.
  */
 export type UnavailableReason =
 	| 'no-providers-configured'
 	| 'sign-in-required'
-	| 'no-model-matched';
+	| 'no-model-matched'
+	| 'temporarily-unavailable';
 
 /** The model resolved for a request. */
 export interface IResolvedModel {

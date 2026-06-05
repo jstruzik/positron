@@ -7,11 +7,11 @@
 
 import { AsyncIterableObject } from '../../../../../base/common/async.js';
 import { Emitter } from '../../../../../base/common/event.js';
-import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
+import { IConfigurationChangeEvent, IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
 import { ILogService, NullLogService } from '../../../../../platform/log/common/log.js';
 import { IEngineChatRequest, IHeadlessLanguageModelEngine, IModelDescriptor, IProviderMapping } from '../../../../../platform/positronHeadlessLanguageModel/common/engine.js';
 import { createTestContainer } from '../../../../../test/vitest/positronTestContainer.js';
-import { AuthenticationSession, IAuthenticationService } from '../../../authentication/common/authentication.js';
+import { AuthenticationProviderInformation, AuthenticationSession, IAuthenticationService } from '../../../authentication/common/authentication.js';
 import { AbstractHeadlessLanguageModelService } from '../../browser/abstractHeadlessLanguageModelService.js';
 
 // A test subclass that hands the facade a fake engine -- the provider-bridge boundary.
@@ -40,16 +40,39 @@ const TEST_MAPPINGS: IProviderMapping[] = [
 	{ providerId: 'openai', authProviderId: 'openai-api', scopes: [], credentialType: 'apikey', configKey: 'openai' },
 ];
 
+// The non-apikey credential types, for the credential-shaping policy tests.
+const POLICY_MAPPINGS: IProviderMapping[] = [
+	{ providerId: 'vertex', authProviderId: 'vertex-api', scopes: [], credentialType: 'google-cloud', configKey: 'vertex' },
+	{ providerId: 'bedrock', authProviderId: 'aws', scopes: [], credentialType: 'aws-credentials', configKey: 'bedrock' },
+];
+
 function fakeEngine(options: {
 	models?: Record<string, IModelDescriptor[]>;
 	mappings?: IProviderMapping[];
+	getProviderMappings?: () => Promise<IProviderMapping[]>;
 	stream?: (request: IEngineChatRequest) => AsyncIterable<string>;
 } = {}): IHeadlessLanguageModelEngine {
 	return {
-		getProviderMappings: async () => options.mappings ?? TEST_MAPPINGS,
+		getProviderMappings: options.getProviderMappings ?? (async () => options.mappings ?? TEST_MAPPINGS),
 		listModels: async (providerId: string) => options.models?.[providerId] ?? [],
 		streamChat: (request: IEngineChatRequest) =>
 			options.stream ? options.stream(request) : AsyncIterableObject.fromArray(['ok']),
+	};
+}
+
+/**
+ * A minimal IConfigurationChangeEvent whose affectsConfiguration matches the
+ * given keys, prefix-aware in both directions (so a change to
+ * `authentication.anthropic.baseUrl` answers true for `authentication` and for
+ * the full key), mirroring the real event.
+ */
+function configChange(...changedKeys: string[]): IConfigurationChangeEvent {
+	return {
+		source: 1,
+		affectedKeys: new Set(changedKeys),
+		change: { keys: changedKeys, overrides: [] },
+		affectsConfiguration: (query: string) =>
+			changedKeys.some(key => key === query || key.startsWith(`${query}.`) || query.startsWith(`${key}.`)),
 	};
 }
 
@@ -68,13 +91,22 @@ function session(authProviderId: string): AuthenticationSession {
 describe('HeadlessLanguageModelService', () => {
 	// Describe-level so the stub captures stable references (builder rule).
 	const sessionsChange = new Emitter<{ providerId: string; label: string; event: { added: readonly AuthenticationSession[]; removed: readonly AuthenticationSession[]; changed: readonly AuthenticationSession[] } }>();
+	const registerProvider = new Emitter<AuthenticationProviderInformation>();
+	const unregisterProvider = new Emitter<AuthenticationProviderInformation>();
+	const configChangeEmitter = new Emitter<IConfigurationChangeEvent>();
 	const createSession = vi.fn();
 	const getSessions = vi.fn(async (id: string): Promise<AuthenticationSession[]> => {
 		// Simulates getSessions timing out / throwing for a provider that errors.
 		if (throwingAuthProviders.has(id)) {
 			throw new Error(`Timed out waiting for authentication provider '${id}' to register.`);
 		}
-		return signedInAuthProviders.has(id) ? [session(id)] : [];
+		if (!signedInAuthProviders.has(id)) {
+			return [];
+		}
+		// A per-provider access-token override lets credential-shaping tests feed
+		// a specific (e.g. malformed JSON) token without re-mocking getSessions.
+		const override = sessionTokenOverrides.get(id);
+		return [override !== undefined ? { ...session(id), accessToken: override } : session(id)];
 	});
 	// Registered auth backends (independent of whether a session exists); the
 	// facade only queries getSessions for these.
@@ -85,18 +117,28 @@ describe('HeadlessLanguageModelService', () => {
 	let registeredAuthProviders: Set<string>;
 	let throwingAuthProviders: Set<string>;
 	let configValues: Map<string, unknown>;
+	let sessionTokenOverrides: Map<string, string>;
 
 	beforeEach(() => {
 		signedInAuthProviders = new Set();
 		registeredAuthProviders = new Set(TEST_MAPPINGS.map(mapping => mapping.authProviderId));
 		throwingAuthProviders = new Set();
 		configValues = new Map();
+		sessionTokenOverrides = new Map();
 	});
 
 	const ctx = createTestContainer()
 		.stub(ILogService, new NullLogService())
-		.stub(IAuthenticationService, { getSessions, createSession, getProviderIds, onDidChangeSessions: sessionsChange.event })
-		.stub(IConfigurationService, { getValue: (key: string) => configValues.get(key) })
+		.stub(IAuthenticationService, {
+			getSessions, createSession, getProviderIds,
+			onDidChangeSessions: sessionsChange.event,
+			onDidRegisterAuthenticationProvider: registerProvider.event,
+			onDidUnregisterAuthenticationProvider: unregisterProvider.event,
+		})
+		.stub(IConfigurationService, {
+			getValue: (key: string) => configValues.get(key),
+			onDidChangeConfiguration: configChangeEmitter.event,
+		})
 		.build();
 
 	function createService(engine: IHeadlessLanguageModelEngine | undefined): TestHeadlessLanguageModelService {
@@ -282,6 +324,170 @@ describe('HeadlessLanguageModelService', () => {
 			expect(result.available).toBe(true);
 			// The stream request resolved credentials again, beyond the listing pass.
 			expect(getSessions.mock.calls.length).toBeGreaterThan(afterListing);
+		});
+	});
+
+	describe('self-heal on transient failure (Task 1)', () => {
+		// An engine whose getProviderMappings rejects the first time and succeeds
+		// after, proving both _mappings and _state self-heal rather than caching
+		// the rejection forever.
+		function rejectThenSucceedEngine(): IHeadlessLanguageModelEngine {
+			let calls = 0;
+			return fakeEngine({
+				models: { anthropic: [model('claude-haiku', 'Claude Haiku', 'anthropic')] },
+				getProviderMappings: async () => {
+					calls += 1;
+					if (calls === 1) {
+						throw new Error('bridge not ready');
+					}
+					return TEST_MAPPINGS;
+				},
+			});
+		}
+
+		it('streamText reports temporarily-unavailable then recovers on retry', async () => {
+			signedInAuthProviders.add('anthropic-api');
+			const service = createService(rejectThenSucceedEngine());
+
+			const first = await service.streamText({ systemPrompt: 's', messages: [] });
+			expect(first).toEqual({ available: false, reason: 'temporarily-unavailable' });
+
+			const second = await service.streamText({ systemPrompt: 's', messages: [] });
+			expect(second.available && second.model.id).toBe('claude-haiku');
+		});
+
+		it('getAvailableModels returns [] then recovers on retry', async () => {
+			signedInAuthProviders.add('anthropic-api');
+			const service = createService(rejectThenSucceedEngine());
+
+			expect(await service.getAvailableModels()).toEqual([]);
+
+			const second = await service.getAvailableModels();
+			expect(second).toEqual([{ id: 'claude-haiku', name: 'Claude Haiku', vendor: 'Acme' }]);
+		});
+	});
+
+	describe('cache staleness (Task 5)', () => {
+		it('a relevant config change invalidates the cached model list', async () => {
+			signedInAuthProviders.add('anthropic-api');
+			const service = createService(fakeEngine({ models: { anthropic: [model('claude-haiku', 'Claude Haiku', 'anthropic')] } }));
+			// Prime the cache and populate the mapping snapshot the handler reads.
+			await service.getAvailableModels();
+			const fired = vi.fn();
+			ctx.disposables.add(service.onDidChangeAvailableModels(fired));
+
+			// A change to a mapped provider's baseUrl drops the cache and notifies.
+			configChangeEmitter.fire(configChange('authentication.anthropic.baseUrl'));
+			expect(fired).toHaveBeenCalledTimes(1);
+
+			// The next listing recomputes rather than serving the dropped cache,
+			// re-querying sessions for the credential sweep.
+			const before = getSessions.mock.calls.length;
+			await service.getAvailableModels();
+			expect(getSessions.mock.calls.length).toBeGreaterThan(before);
+		});
+
+		it('an unrelated config change does not invalidate the cache', async () => {
+			signedInAuthProviders.add('anthropic-api');
+			const service = createService(fakeEngine({ models: { anthropic: [model('claude-haiku', 'Claude Haiku', 'anthropic')] } }));
+			await service.getAvailableModels();
+			const fired = vi.fn();
+			ctx.disposables.add(service.onDidChangeAvailableModels(fired));
+
+			configChangeEmitter.fire(configChange('editor.fontSize'));
+			expect(fired).not.toHaveBeenCalled();
+		});
+
+		it('registering a mapped auth provider invalidates the cache and recomputes', async () => {
+			// Start with no registered providers: the first listing is empty.
+			registeredAuthProviders = new Set();
+			const service = createService(fakeEngine({ models: { anthropic: [model('claude-haiku', 'Claude Haiku', 'anthropic')] } }));
+			expect(await service.getAvailableModels()).toEqual([]);
+
+			const fired = vi.fn();
+			ctx.disposables.add(service.onDidChangeAvailableModels(fired));
+
+			// The user signs into anthropic: the backend registers, then a session exists.
+			signedInAuthProviders.add('anthropic-api');
+			registeredAuthProviders.add('anthropic-api');
+			registerProvider.fire({ id: 'anthropic-api', label: 'Anthropic' });
+			expect(fired).toHaveBeenCalledTimes(1);
+
+			// The recomputed listing now sees the newly registered, signed-in provider.
+			expect(await service.getAvailableModels()).toEqual([{ id: 'claude-haiku', name: 'Claude Haiku', vendor: 'Acme' }]);
+		});
+
+		it('registering an unmapped auth provider does not invalidate the cache', async () => {
+			const service = createService(fakeEngine());
+			await service.getAvailableModels();
+			const fired = vi.fn();
+			ctx.disposables.add(service.onDidChangeAvailableModels(fired));
+
+			registerProvider.fire({ id: 'some-unrelated-provider', label: 'Other' });
+			expect(fired).not.toHaveBeenCalled();
+		});
+	});
+
+	describe('credential-shaping policy (Task 4)', () => {
+		// Captures the shaped credentials the facade hands the engine, so a test
+		// can assert the policy (drop on malformed token, region defaulting)
+		// rather than re-asserting a full happy-path shape that would rot.
+		function capturingEngine(models: Record<string, IModelDescriptor[]>): {
+			engine: IHeadlessLanguageModelEngine;
+			captured: IEngineChatRequest[];
+		} {
+			const captured: IEngineChatRequest[] = [];
+			const engine = fakeEngine({
+				models,
+				mappings: POLICY_MAPPINGS,
+				stream: (request: IEngineChatRequest) => {
+					captured.push(request);
+					return AsyncIterableObject.fromArray(['ok']);
+				},
+			});
+			return { engine, captured };
+		}
+
+		it('drops a google-cloud provider whose token is missing project/location', async () => {
+			// A malformed blob (no project, no location) shapes to no credential, so
+			// the provider is silently dropped -- the support trap the test pins.
+			registeredAuthProviders = new Set(['vertex-api']);
+			signedInAuthProviders.add('vertex-api');
+			sessionTokenOverrides.set('vertex-api', JSON.stringify({ token: 'abc' }));
+			const { engine } = capturingEngine({ vertex: [model('gemini', 'Gemini', 'vertex')] });
+			const service = createService(engine);
+
+			const result = await service.streamText({ systemPrompt: 's', messages: [] });
+			expect(result).toEqual({ available: false, reason: 'sign-in-required' });
+		});
+
+		it('drops an aws provider whose token is missing accessKeyId/secretAccessKey', async () => {
+			registeredAuthProviders = new Set(['aws']);
+			signedInAuthProviders.add('aws');
+			sessionTokenOverrides.set('aws', JSON.stringify({ accessKeyId: 'AK' }));
+			const { engine } = capturingEngine({ bedrock: [model('claude-bedrock', 'Claude (Bedrock)', 'bedrock')] });
+			const service = createService(engine);
+
+			const result = await service.streamText({ systemPrompt: 's', messages: [] });
+			expect(result).toEqual({ available: false, reason: 'sign-in-required' });
+		});
+
+		it('defaults the aws region to us-east-1 when authentication.aws.credentials is unset', async () => {
+			registeredAuthProviders = new Set(['aws']);
+			signedInAuthProviders.add('aws');
+			sessionTokenOverrides.set('aws', JSON.stringify({ accessKeyId: 'AK', secretAccessKey: 'SK' }));
+			const { engine, captured } = capturingEngine({ bedrock: [model('claude-bedrock', 'Claude (Bedrock)', 'bedrock')] });
+			const service = createService(engine);
+
+			const result = await service.streamText({ systemPrompt: 's', messages: [] });
+			expect(result.available).toBe(true);
+			expect(captured[0].credentials).toEqual({
+				type: 'aws-credentials',
+				region: 'us-east-1',
+				accessKeyId: 'AK',
+				secretAccessKey: 'SK',
+				sessionToken: undefined,
+			});
 		});
 	});
 });
