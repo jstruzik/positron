@@ -18,6 +18,11 @@
   "contributes": {
     "commands": [
       {
+        "command": "notebook.export",
+        "title": "%command.notebook.export.title%",
+        "category": "%category.notebook%"
+      },
+      {
         "command": "positronNotebookHelpers.convertImageToBase64",
         "title": "%command.positronNotebookHelpers.convertImageToBase64.title%"
       },
@@ -25,7 +30,16 @@
         "command": "positronNotebookHelpers.fetchRemoteImage",
         "title": "%command.positronNotebookHelpers.fetchRemoteImage.title%"
       }
-    ]
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "notebook.export",
+          "group": "zzz_share",
+          "when": "resourceExtname == .ipynb"
+        }
+      ]
+    }
   },
   "main": "./out/extension.js",
   "scripts": {

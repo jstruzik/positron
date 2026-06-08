@@ -1,0 +1,5 @@
+{
+	// TODO: Shouldn't need this after rebasing.
+	//  May not even need a test workspace?
+	"positron.notebook.enabled": true,
+}

@@ -8,6 +8,9 @@ import * as vscode from 'vscode';
 import { readFile } from 'fs';
 import * as https from 'https';
 import * as http from 'http';
+import { registerNotebookExport } from './notebookExport.js';
+import { PositronNotebooksExtensionImpl } from './api.js';
+import { Command } from './types.js';
 
 // Make sure this matches the error message type defined where used
 // (src/vs/workbench/contrib/positronNotebook/browser/notebookCells/DeferredImage.tsx)
@@ -21,10 +24,13 @@ type ConversionErrorMsg = {
  * @param context An ExtensionContext that contains the extention context.
  */
 export function activate(context: vscode.ExtensionContext) {
+	// Create the API exposed to other extensions.
+	const api = new PositronNotebooksExtensionImpl();
+
 	// Command that converts an image from the local file-system to a base64 string.
 	context.subscriptions.push(
 		vscode.commands.registerCommand(
-			'positronNotebookHelpers.convertImageToBase64',
+			Command.ConvertImageToBase64,
 			async (imageSrc: string, baseLoc: string) => new Promise<string | ConversionErrorMsg>((resolve) => {
 				const fullImagePath = path.join(baseLoc, imageSrc);
 				const fileExtension = path.extname(imageSrc).slice(1);
@@ -72,7 +78,7 @@ export function activate(context: vscode.ExtensionContext) {
 	 */
 	context.subscriptions.push(
 		vscode.commands.registerCommand(
-			'positronNotebookHelpers.fetchRemoteImage',
+			Command.FetchRemoteImage,
 			(imageUrl: string) => new Promise<string | ConversionErrorMsg>((resolve) => {
 				// Determine protocol
 				const protocol = imageUrl.startsWith('https:') ? https : http;
@@ -143,6 +149,11 @@ export function activate(context: vscode.ExtensionContext) {
 			})
 		)
 	);
+
+	// Register the notebook export feature.
+	context.subscriptions.push(...registerNotebookExport(api));
+
+	return api;
 }
 
 
