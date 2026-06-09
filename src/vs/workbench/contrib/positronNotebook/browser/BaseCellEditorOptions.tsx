@@ -28,12 +28,11 @@ export class BaseCellEditorOptions extends Disposable implements IBaseCellEditor
 		},
 		renderLineHighlightOnlyWhenFocus: true,
 		overviewRulerLanes: 0,
-		lineDecorationsWidth: 0,
-		folding: true,
+		lineDecorationsWidth: 10,
 		fixedOverflowWidgets: true,
 		minimap: { enabled: false },
 		renderValidationDecorations: 'on',
-		lineNumbersMinChars: 3
+		lineNumbersMinChars: 2
 	};
 
 	private readonly _localDisposableStore = this._register(new DisposableStore());
